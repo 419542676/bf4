@@ -1,3 +1,0 @@
-/home/xsh/BIFANG_03/build/CMakeFiles/BIFANG.dir
-/home/xsh/BIFANG_03/build/CMakeFiles/edit_cache.dir
-/home/xsh/BIFANG_03/build/CMakeFiles/rebuild_cache.dir

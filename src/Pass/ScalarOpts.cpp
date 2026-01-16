@@ -11,7 +11,8 @@
 // 辅助函数定义
 bool isIntConst(ValueRef* v) { return v && v->type == RefType::IntConst; }
 int getIntVal(ValueRef* v) { return dynamic_cast<Int_Const*>(v)->value; }
-
+bool isBoolConst(ValueRef* v) { return v && v->type == RefType::BoolConst; }
+int getBoolVal(ValueRef* v) { return dynamic_cast<Bool_Const*>(v)->value ? 1 : 0; }
 // --- 1. 存储-加载转发 (Load-Store Forwarding) ---
 void ScalarOpts::runStoreLoadForwarding() {
     for (auto& [name, func] : globalUnit->func_table) {
@@ -253,8 +254,7 @@ void ScalarOpts::runDeadCodeElimination() {
         }
     }
 }
-
-// --- 5. 控制流简化 (维护 CFG 图连接) ---
+// 5. 控制流简化 (维护 CFG 图连接) ---
 void ScalarOpts::runCFGSimplification() {
     for (auto& [name, func] : globalUnit->func_table) {
         for (auto block : func->block_list) {
@@ -263,25 +263,44 @@ void ScalarOpts::runCFGSimplification() {
 
             if (terminator->instType == InstType_Enum::CONDBR) {
                 auto condBr = dynamic_cast<CondBrInstruction*>(terminator);
-                if (isIntConst(condBr->condition)) {
-                    int val = getIntVal(condBr->condition);
-                    
-                    BasicBlock* takenBlock = (val != 0) ? condBr->trueLabel : condBr->falseLabel;
-                    BasicBlock* notTakenBlock = (val != 0) ? condBr->falseLabel : condBr->trueLabel;
+                
+                // 统一获取条件值 (支持 IntConst 和 BoolConst)
+                bool isConstant = false;
+                bool conditionIsTrue = false;
 
+                if (isIntConst(condBr->condition)) {
+                    isConstant = true;
+                    conditionIsTrue = (getIntVal(condBr->condition) != 0);
+                } 
+                else if (isBoolConst(condBr->condition)) { // [修复] 增加对 BoolConst 的支持
+                    isConstant = true;
+                    conditionIsTrue = (getBoolVal(condBr->condition) != 0);
+                }
+
+                if (isConstant) {
+                    BasicBlock* takenBlock = conditionIsTrue ? condBr->trueLabel : condBr->falseLabel;
+                    BasicBlock* notTakenBlock = conditionIsTrue ? condBr->falseLabel : condBr->trueLabel;
+
+                    // 1. 创建新的无条件跳转
                     auto newBr = new BrInstruction(takenBlock);
                     newBr->block = block;
                     
+                    // 2. 替换指令
                     block->local_instr.pop_back();
                     block->local_instr.push_back(newBr);
                     terminator->deleted = true;
 
-                    // 更新 CFG 图结构：断开与 notTakenBlock 的连接
-                    auto& succs = block->succ;
-                    succs.erase(std::remove(succs.begin(), succs.end(), notTakenBlock), succs.end());
+                    // 3. 维护 CFG 图结构 (关键修复：防止同一目标块被错误断开)
+                    // 只有当“走的分支”和“不走的分支”不是同一个块时，才断开与“不走分支”的连接
+                    if (takenBlock != notTakenBlock) {
+                        // 从当前块的后继中移除 notTakenBlock
+                        auto& succs = block->succ;
+                        succs.erase(std::remove(succs.begin(), succs.end(), notTakenBlock), succs.end());
 
-                    auto& preds = notTakenBlock->pred;
-                    preds.erase(std::remove(preds.begin(), preds.end(), block), preds.end());
+                        // 从 notTakenBlock 的前驱中移除当前块
+                        auto& preds = notTakenBlock->pred;
+                        preds.erase(std::remove(preds.begin(), preds.end(), block), preds.end());
+                    }
 
                     this->changed = true;
                 }
