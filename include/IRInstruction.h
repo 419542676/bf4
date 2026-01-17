@@ -633,26 +633,33 @@ public:
 
     void replace(ValueRef *old, ValueRef *now) override;
 };
-
 class PhiInstruction : public IRInstruction {
 public:
-    ValueRef* symbol; // you shouldn't use this
-    ValueRef* result;
-    int branch_cnt;
-    map<BasicBlock*, ValueRef*> mp;
+    ValueRef* symbol; // 对应的变量符号 (通常是 alloca 的 dst)
+    ValueRef* result; // Phi 指令定义的新 SSA 值
+    int branch_cnt;   // 分支数量 (保留兼容性，实际上可以用 mp.size())
+    map<BasicBlock*, ValueRef*> mp; // Key: 前驱块, Value: 来自该块的值
 
-    PhiInstruction(ValueRef* symbol,ValueRef* result,int cnt);
+    PhiInstruction(ValueRef* symbol, ValueRef* result, int cnt);
+
+    // [新增] 标准 SSA 构建辅助函数
+    void addIncoming(ValueRef* val, BasicBlock* block) {
+        this->mp[block] = val; // 记录映射
+        val->use.push_back(this);     // 维护 Use-Def 链：val 被 this 指令使用了
+    }
     
+    // ... 其他原有函数保持不变 ...
     void codegen(AsmBuilder *pBuilder,
                  std::map<std::string, int> &offset_table,
                  std::map<std::string, int> &size_table,
                  int frameSize) override
     {
-        throw exception();
+        // 后端暂时不支持 Phi，需要在寄存器分配前消除 Phi (Phi Elimination)
+        // 或者抛出异常提醒
+        // throw exception(); 
     }
 
     void outPut(std::ostream &os) override;
-
     void replace(ValueRef *old, ValueRef *now) override;
 };
 

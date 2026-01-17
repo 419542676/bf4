@@ -2,21 +2,23 @@
 #include "IRInstruction.h"
 #include "Pass/OptUtils.h"
 #include "Pass/DomNode.h"
-#include<map>
-#include<set>
-#include<stack>
-using namespace std;
-//将IR中的堆栈变量转换为SSA形式，即将内存中的变量优化为寄存器变量
-//引入Phi节点来处理多个分支合并时的变量值问题
-// insertPhi uses
-map<ValueRef*,set<BasicBlock*>> defsites; // describe what blocks def this ref
-map<BasicBlock*,set<ValueRef*>> placed; // describe what ref need to be phi in one block
-Undef* undef = new Undef();
-// renamePhi uses
-map<ValueRef*,stack<ValueRef*>> st;// stack top = live var(we use it to replace symbol)
+#include <map>
+#include <set>
+#include <stack>
+#include <vector>
+#include <algorithm>
 
-// del use in load/store
-void DelUseinLS(ValueRef* ref){
+using namespace std;
+
+// 静态全局变量，避免跨文件链接错误
+static map<ValueRef*, set<BasicBlock*>> defsites;
+static map<BasicBlock*, set<ValueRef*>> placed;
+static map<ValueRef*, stack<ValueRef*>> st;
+static Undef* undef_val = nullptr; // 用于表示未定义的值
+
+// 辅助函数：清理 Load/Store 的 Use 关系
+static void DelUseinLS(ValueRef* ref){
+    if (!ref) return;
     for(auto it = ref->use.begin(); it != ref->use.end();){
         if((*it)->instType == LOAD || (*it)->instType == STORE){
             it = ref->use.erase(it);
@@ -28,10 +30,17 @@ void DelUseinLS(ValueRef* ref){
 }
 
 void Mem2RegPass::run() {
+    if (undef_val == nullptr) undef_val = new Undef();
+
     for(auto& [name,func] : globalUnit->func_table){
+        if(func->block_list.empty()) continue;
+
+        // 只有计算了支配树根节点，才能运行 Mem2Reg
         if(func->dom_root != nullptr) {
             st.clear();
-            Utils::labelCounter = 0;
+            defsites.clear();
+            placed.clear();
+            
             insertPhi(func);
             renamePhi(func->dom_root);
             mergeEntry(func);
@@ -40,22 +49,33 @@ void Mem2RegPass::run() {
 }
 
 void Mem2RegPass::insertPhi(Function *func) {
-    for(auto block:func->block_list){ // cal defsites
-        for(auto instr:block->local_instr){
+    // 1. 计算 defsites (变量在哪些块中被定义/Store)
+    for(auto block : func->block_list){
+        for(auto instr : block->local_instr){
             if(instr->def_list.empty()) continue;
             ValueRef * var = *(instr->def_list.begin());
+            // 只处理非全局的 Symbol (局部变量)
             if(var->type == SYMBOL && !dynamic_cast<Symbol*>(var)->is_global)
                 defsites[var].insert(block);
         }
     }
 
-    for(auto& [var,defs]: defsites){
+    // 2. 插入 Phi 节点 (基于支配边界)
+    for(auto& [var, defs]: defsites){
         bool is_int = ((Symbol*)var)->symbolType->type == INT32TYPE;
-        while(!defs.empty()){
-            BasicBlock* block = *(defs.begin()); defs.erase(defs.begin());
-            auto DF = block->domNode->DF;
-            for(auto df : DF){
-                BasicBlock* bb = df->bb;
+        
+        // Worklist 算法
+        vector<BasicBlock*> W(defs.begin(), defs.end());
+        
+        while(!W.empty()){
+            BasicBlock* block = W.back();
+            W.pop_back();
+            
+            if (!block->domNode) continue;
+
+            auto& DF = block->domNode->DF;
+            for(auto df_node : DF){
+                BasicBlock* bb = df_node->bb;
                 if(!placed[bb].count(var)){
                     ValueRef* result;
                     if(is_int)
@@ -63,12 +83,18 @@ void Mem2RegPass::insertPhi(Function *func) {
                     else
                         result = new Float_Var("%phi_");
 
-                    IRInstruction * phi = new PhiInstruction(var,result,bb->pred.size());
-                    Insert_instr_atFront(phi,bb);
+                    // 创建 Phi 指令
+                    PhiInstruction * phi = new PhiInstruction(var, result, bb->pred.size());
+                    
+                    // [重要] 注册 def，防止 LICM 误判为不变量
+                    result->def.push_back(phi);
+
+                    Insert_instr_atFront(phi, bb);
                     placed[bb].insert(var);
 
-                    if(!bb->live_def.count(var)){
-                        defsites[var].insert(bb);
+                    if(defsites[var].find(bb) == defsites[var].end()){
+                        defsites[var].insert(bb); // Phi 本身也是定义
+                        W.push_back(bb);
                     }
                 }
             }
@@ -77,40 +103,56 @@ void Mem2RegPass::insertPhi(Function *func) {
 }
 
 void Mem2RegPass::renamePhi(DomNode * root) {
-    map<ValueRef*,int> counter; // mark how many times one var is defined(push into stack) in this block
+    map<ValueRef*, int> counter;
     BasicBlock* nowBlock = root->bb;
     auto& instructions = nowBlock->local_instr;
+
     for(auto it = instructions.begin(); it != instructions.end();){
-        if((*it)->instType == LOAD){ // use
-            // load src -> dst,we want to delete this LOADinstr, so replace dst
-            ValueRef* src = ((LoadInstruction*)(*it))->src;
-            ValueRef* dst = ((LoadInstruction*)(*it))->dst;
-            if(src->type == Ptr || dynamic_cast<Symbol*>(src) -> is_global) { // we don't simplify global symbol and array/ptr;
+        if((*it)->instType == LOAD){
+            LoadInstruction* loadInst = (LoadInstruction*)(*it);
+            ValueRef* src = loadInst->src;
+            ValueRef* dst = loadInst->dst;
+
+            // 忽略指针类型和全局变量
+            if(src->type == Ptr || (src->type == SYMBOL && dynamic_cast<Symbol*>(src)->is_global)) {
                 ++it;
                 continue;
             }
-            ValueRef* replaced = st[src].top();
+
+            // 替换为栈顶值 (最近的定义)
+            ValueRef* replaced = nullptr;
+            if (st.count(src) && !st[src].empty()) {
+                replaced = st[src].top();
+            } else {
+                replaced = undef_val;
+            }
+            
             replaceAllUsesOf(dst, replaced);
-
-            it = instructions.erase(it);
+            it = instructions.erase(it); // 删除 Load
         }
-        else if((*it)->instType == STORE) { // def
-            ValueRef* src = ((StoreInstruction*)(*it))->src;
-            ValueRef* dst = ((StoreInstruction*)(*it))->dst;
-            // store src -> dst,  we record src as def to replace other uses
+        else if((*it)->instType == STORE) {
+            StoreInstruction* storeInst = (StoreInstruction*)(*it);
+            ValueRef* src = storeInst->src;
+            ValueRef* dst = storeInst->dst;
 
-            if(dst->type == Ptr || dynamic_cast<Symbol*>(dst) -> is_global) { // we don't simplify global symbol and array/ptr;
+            if(dst->type == Ptr || (dst->type == SYMBOL && dynamic_cast<Symbol*>(dst)->is_global)) {
                 ++it;
                 continue;
             }
-            st[dst].push(src); counter[dst]++;
-            DelUseinLS(src);
-            it = instructions.erase(it);
+            
+            st[dst].push(src);
+            counter[dst]++;
+            DelUseinLS(src); 
+            
+            it = instructions.erase(it); // 删除 Store
         }
-        else if((*it)->instType == PHI){ //
-            ValueRef* var = ((PhiInstruction*)(*it))->symbol;
-            ValueRef* value = ((PhiInstruction*)(*it))->result;
-            st[var].push(value); counter[var]++;
+        else if((*it)->instType == PHI){
+            PhiInstruction* phi = (PhiInstruction*)(*it);
+            ValueRef* var = phi->symbol;
+            ValueRef* value = phi->result;
+            
+            st[var].push(value);
+            counter[var]++;
             ++it;
         }
         else{
@@ -118,26 +160,31 @@ void Mem2RegPass::renamePhi(DomNode * root) {
         }
     }
 
-    for(auto next: nowBlock->succ){ // rename phi node
+    // 填充后继块的 Phi 参数
+    for(auto next: nowBlock->succ){
         for(auto instr: next->local_instr){
             if(instr->instType != PHI) break;
             auto phi = (PhiInstruction*)instr;
             ValueRef* var = phi->symbol;
+            
+            ValueRef* val = nullptr;
             if(st[var].empty()){
-                phi->mp[nowBlock] = undef;
+                val = undef_val;
+            } else {
+                val = st[var].top();
             }
-            else {
-                phi->mp[nowBlock] = st[var].top();
-                phi->addUse(st[var].top());
-            }
-            phi->addUse(nowBlock);
+            
+            // 使用 addIncoming (需要在 IRInstruction.h 中有此方法，或者直接操作 mp 和 use)
+            phi->addIncoming(val, nowBlock);
         }
     }
 
-    for(auto child: root->child){ // recursive-call
+    // [修正] 这里改为 children，与 DomNode.h 保持一致
+    for(auto child: root->children){
         renamePhi(child);
     }
 
+    // 恢复栈状态 (Backtracking)
     for(auto&[var,cnt]:counter){
         for(int i=0;i<cnt;++i)
             st[var].pop();
@@ -145,28 +192,34 @@ void Mem2RegPass::renamePhi(DomNode * root) {
 }
 
 void Mem2RegPass::mergeEntry(Function *func) {
-    // just delete entry block and all non-arr alloc instr in it;
-    BasicBlock* entry = func->entry; // this block only has allca instr;
-    BasicBlock* next = entry->succ[0]; // real entry block
+    if (!func->entry || func->entry->succ.empty()) return;
+
+    BasicBlock* entry = func->entry;
+    BasicBlock* next = entry->succ[0];
+
+    // 将 entry 块中的数组 alloca 移动到 next 块
     auto& v = entry->local_instr;
     stack<Instruction*> stk;
-    for(auto it = v.begin();;){
-        auto instr = dynamic_cast<AllocaInstruction*>(*it);
-        if(instr == nullptr)  // last instr(jump to next block)
-            break;
-        if(instr->varType->type == ARRAYTYPE) { // if arr alloc instr, move it to next block
-            stk.push(*it);
+    
+    for(auto it = v.begin(); it != v.end();){
+        if ((*it)->instType == ALLOCA) {
+            auto instr = dynamic_cast<AllocaInstruction*>(*it);
+            if(instr->varType->type == ARRAYTYPE) {
+                stk.push(*it);
+            }
         }
         it = v.erase(it);
     }
 
     while(!stk.empty()){
-        Insert_instr_atFront(stk.top(),next);
+        Insert_instr_atFront(stk.top(), next);
         stk.pop();
     }
 
-    //finally delete this entry block;
+    // 移除 entry 块
     next->pred.clear();
-    func->block_list.erase(func->block_list.begin());
+    if (!func->block_list.empty() && func->block_list[0] == entry) {
+        func->block_list.erase(func->block_list.begin());
+    }
     func->entry = next;
 }

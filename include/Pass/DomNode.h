@@ -1,26 +1,28 @@
-#include "BasicBlock.h"
-#include <vector>
 #ifndef COMPILER_DOMNODE_H
 #define COMPILER_DOMNODE_H
 
+#include <vector>
+#include "BasicBlock.h"
+
 class DomNode {
 public:
-    int nodeId;
-    BasicBlock * bb;
+    BasicBlock *bb;
+    
+    // 支配树上的直接父节点 (Immediate Dominator)
+    DomNode *IDOM = nullptr;
+    
+    // 支配树上的子节点 (用于遍历支配树)
+    std::vector<DomNode*> children;
+    
+    // 支配边界 (Dominance Frontier) - Mem2Reg 必须用这个
+    std::vector<DomNode*> DF;
+    
+    // 深度 (用于计算最近公共祖先)
+    int depth = 0;
 
-    std::vector<DomNode*> DOM; // 支配父节点
-    std::vector<DomNode*> child; // 支配子节点
-    DomNode* IDOM; //该节点在支配树中的父节点
-    std::vector<DomNode*> DF; //该节点的支配前集
-
-    int depth;
-
-    DomNode(int id,BasicBlock * block);
-
-    bool dominate(DomNode * d){
-        return std::find(DOM.begin(), DOM.end(),d) != DOM.end();
-    }
+    // [修改点] 这里去掉函数体 {} 和冒号初始化，只保留分号 ;
+    // 实现已经在 src/Pass/DomNode.cpp 中写好了
+    explicit DomNode(BasicBlock *bb);
 };
-
 
 #endif

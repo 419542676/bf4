@@ -13,6 +13,7 @@ bool isIntConst(ValueRef* v) { return v && v->type == RefType::IntConst; }
 int getIntVal(ValueRef* v) { return dynamic_cast<Int_Const*>(v)->value; }
 bool isBoolConst(ValueRef* v) { return v && v->type == RefType::BoolConst; }
 int getBoolVal(ValueRef* v) { return dynamic_cast<Bool_Const*>(v)->value ? 1 : 0; }
+
 // --- 1. 存储-加载转发 (Load-Store Forwarding) ---
 void ScalarOpts::runStoreLoadForwarding() {
     for (auto& [name, func] : globalUnit->func_table) {
@@ -240,6 +241,19 @@ void ScalarOpts::runDeadCodeElimination() {
                         auto& preds = succ->pred;
                         // 从后继的前驱列表中移除当前块
                         preds.erase(std::remove(preds.begin(), preds.end(), block), preds.end());
+                        
+                        // [关键修复] 同时要清理后继块 Phi 节点中关于当前块的引用
+                        // 否则后继块的 Phi 会指向一个已经删除的块 (Zombie Phi)
+                        for (auto inst : succ->local_instr) {
+                            if (inst->instType == InstType_Enum::PHI) {
+                                auto phi = dynamic_cast<PhiInstruction*>(inst);
+                                if (phi->mp.count(block)) {
+                                    phi->mp.erase(block);
+                                }
+                            } else {
+                                break; // Phi 必定在 Block 开头
+                            }
+                        }
                     }
                     
                     // 2. 从函数的基本块列表中真正移除
@@ -254,6 +268,7 @@ void ScalarOpts::runDeadCodeElimination() {
         }
     }
 }
+
 // 5. 控制流简化 (维护 CFG 图连接) ---
 void ScalarOpts::runCFGSimplification() {
     for (auto& [name, func] : globalUnit->func_table) {
@@ -272,7 +287,7 @@ void ScalarOpts::runCFGSimplification() {
                     isConstant = true;
                     conditionIsTrue = (getIntVal(condBr->condition) != 0);
                 } 
-                else if (isBoolConst(condBr->condition)) { // [修复] 增加对 BoolConst 的支持
+                else if (isBoolConst(condBr->condition)) { 
                     isConstant = true;
                     conditionIsTrue = (getBoolVal(condBr->condition) != 0);
                 }
@@ -300,6 +315,20 @@ void ScalarOpts::runCFGSimplification() {
                         // 从 notTakenBlock 的前驱中移除当前块
                         auto& preds = notTakenBlock->pred;
                         preds.erase(std::remove(preds.begin(), preds.end(), block), preds.end());
+
+                        // [关键修复] 处理“僵尸 Phi”
+                        // 既然切断了 block -> notTakenBlock 的边，那么 notTakenBlock 里的 Phi 节点
+                        // 就不应该再从 block 获取值了。必须从 map 中删除该条目。
+                        for (auto inst : notTakenBlock->local_instr) {
+                            if (inst->instType == InstType_Enum::PHI) {
+                                auto phi = dynamic_cast<PhiInstruction*>(inst);
+                                if (phi->mp.count(block)) {
+                                    phi->mp.erase(block);
+                                }
+                            } else {
+                                break; // Phi 必定在 Block 开头
+                            }
+                        }
                     }
 
                     this->changed = true;
