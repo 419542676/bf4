@@ -43,23 +43,23 @@ void PhiElimination::runOnFunction(Function* func) {
 
         // A. 在 Entry 块创建临时栈变量
         Type* valType;
-        // 简单的类型判断
-        if(phiResult->type == INT32TYPE || phiResult->type == IntVar) 
+        if(phiResult->type == IntVar || phiResult->type == IntConst) 
             valType = new Type(INT32TYPE);
         else 
             valType = new Type(FLOATTYPE);
 
-        // [修正 1]: 尝试最常见的 Symbol 构造函数 (名字, 是否全局)
         string nameStr = "%phi_demote_" + to_string(Utils::labelCounter++);
-        Symbol* allocaAddr = new Symbol(nameStr, false); // false 表示局部变量
         
-        // [修正 2]: 手动设置符号的数据类型为指针 (因为 Alloca 分配的是地址)
-        // 注意：allocaAddr->type 是 RefType (SYMBOL)，不需要改
-        // 我们要改的是 symbolType
-        allocaAddr->symbolType = new PointerType(valType);
+        // [修正 1]: 构造 Symbol (Alloca 需要指针类型)
+        Type* ptrType = new PointerType(valType);
+        Symbol* allocaAddr = new Symbol(ptrType, nameStr, false); 
+        
+        // [关键修正]: 必须将新创建的符号加入到函数的符号表中！
+        // 否则 Function::codegen 计算栈偏移量时会漏掉它，导致后端查不到 offset 出现段错误
+        func->symbol_table[nameStr] = allocaAddr;
 
-        // [修正 3]: 交换 Alloca 参数顺序 (先类型，后目标)
-        AllocaInstruction* allocaInst = new AllocaInstruction(valType, allocaAddr);
+        // [修正 2]: 构造 Alloca 指令
+        AllocaInstruction* allocaInst = new AllocaInstruction(allocaAddr, valType, nameStr);
         
         // 插入到 Entry 开头
         auto insertIt = func->entry->local_instr.begin();
@@ -70,8 +70,7 @@ void PhiElimination::runOnFunction(Function* func) {
 
         // B. 在所有前驱块的末尾插入 Store
         for (auto const& [predBlock, val] : phi->mp) {
-            // StoreInstruction(值, 地址)
-            StoreInstruction* storeInst = new StoreInstruction(val, allocaAddr);
+            StoreInstruction* storeInst = new StoreInstruction(allocaAddr, val);
             
             if (predBlock->local_instr.empty()) {
                 predBlock->local_instr.push_back(storeInst);
@@ -88,8 +87,7 @@ void PhiElimination::runOnFunction(Function* func) {
         }
 
         // C. 在 Phi 所在块的开头，用 Load 替换 Phi
-        // LoadInstruction(地址, 目标寄存器)
-        LoadInstruction* loadInst = new LoadInstruction(allocaAddr, phiResult);
+        LoadInstruction* loadInst = new LoadInstruction(phiResult, allocaAddr);
         
         auto& instrs = phiBlock->local_instr;
         for (auto it = instrs.begin(); it != instrs.end(); ++it) {
@@ -100,3 +98,4 @@ void PhiElimination::runOnFunction(Function* func) {
         }
     }
 }
+
