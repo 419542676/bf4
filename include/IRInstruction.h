@@ -437,9 +437,12 @@ public:
 
     AllocaInstruction(ValueRef* dst, Type* varType, string& debugInfo);
 
-    void outPut(std::ostream &os) override { os << debugInfo << endl; }
 
     void replace(ValueRef *old, ValueRef *now) override;
+    void outPut(std::ostream &os)  override;
+    void codegen(AsmBuilder *pBuilder, std::map<std::string, int> &offset_table,
+                 std::map<std::string, int> &size_table, int frameSize) override;
+                 
 };
 
 class LoadInstruction : public IRInstruction {

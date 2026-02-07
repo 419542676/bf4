@@ -210,6 +210,7 @@ void BasicBlock::codegen(AsmBuilder *builder,
 
     }
     for (auto inst : local_instr) {
+        std::cerr << "[Debug] Codegen for inst type: " << inst->instType << std::endl;
         inst->codegen(builder,offset_table, size_table, framesize);
     }
     cur_func->insert_block(cur_block);

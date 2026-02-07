@@ -61,9 +61,11 @@ public:
     void computeLiveIntervals(MachineFunction *mFunc);
     void linearScanRegisterAllocation(MachineFunction *mFunc);
     void expireOldIntervals(Interval *i);
-    void spillInterval(Interval *i, int framesize);
+    
     void expireOldIntervals_f(Interval *i);
-    void spillInterval_f(Interval *i, int framesize);
+    void spillInterval(Interval *i, MachineFunction *mFunc);
+    void spillInterval_f(Interval *i, MachineFunction *mFunc);
+    
     void updateUsedPhysicalRegs(const std::string &func_name, IREGISTER reg);
     void updateUsedPhysicalRegs_f(const std::string &func_name, Fregister reg);
     void rewrite(MachineFunction *mFunc);

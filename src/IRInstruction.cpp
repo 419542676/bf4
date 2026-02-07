@@ -7,7 +7,31 @@
 #include "math.h"
 
 using namespace std;
+static std::string getTypeNameSafe(ValueRef* val) {
+    if (!val) return "void";
 
+    // 1. 尝试转换为 Symbol (变量通常是 Symbol)
+    if (auto sym = dynamic_cast<Symbol*>(val)) {
+        if (sym->symbolType) {
+            return sym->symbolType->getTypeName();
+        }
+    }
+
+    // 2. 如果不是 Symbol (例如常量)，则根据 RefType 枚举判断
+    // 注意：这里假设 IntConst, IntVar 等枚举值在当前作用域可见 (IRInstruction.cpp 通常包含了相关头文件)
+    if (val->type == IntConst || val->type == IntVar) return "i32";
+    if (val->type == FloatConst || val->type == FloatVar) return "float";
+    
+    // 3. 特殊处理 Ptr 类型 (如果有)
+    if (val->type == Ptr) {
+        // 如果是指针，这里简单返回 i32* 或者 void*，视情况而定
+        // 但通常 Store/Load 的操作数如果是 Ptr，它通常也是 Symbol
+        return "i32*"; 
+    }
+
+    // 4. 默认回退
+    return "i32";
+}
 int IRInstruction::vRegCount = 0;
 int IRInstruction::vfRegCount = 0;
 int IRInstruction::labelCount = 0;
@@ -113,6 +137,11 @@ void AllocaInstruction::replace(ValueRef *old, ValueRef *now) {
     throw exception();
 }
 
+void AllocaInstruction::codegen(AsmBuilder *pBuilder, std::map<std::string, int> &offset_table,
+                                std::map<std::string, int> &size_table, int frameSize) {
+    // 故意留空：Do nothing.
+}
+
 LoadInstruction::LoadInstruction(ValueRef *dst, ValueRef *src) : IRInstruction(LOAD){
     this->dst = dst;
     this->src = src;
@@ -120,12 +149,11 @@ LoadInstruction::LoadInstruction(ValueRef *dst, ValueRef *src) : IRInstruction(L
     addDef(dst);
     addUse(src);
 }
-
 void LoadInstruction::codegen(AsmBuilder *pBuilder, std::map<std::string, int> &offset_table,
                               std::map<std::string, int> &size_table, int frameSize) {
 //    cout << this->src->type << endl;
-    //检查源操作数类型
-    //全局变量，先用LA指令加载地址到虚拟寄存器
+    // 检查源操作数类型
+    // 全局变量，先用LA指令加载地址到虚拟寄存器
     if(this->src->get_Ref()[0] == '@'){
         // if (pBuilder->mUnit->global_symbol.find(this->src->get_Ref()) != pBuilder->mUnit->global_symbol.end()) {
         auto la = new LoadImmInstruction(pBuilder->getBlock(),
@@ -133,45 +161,74 @@ void LoadInstruction::codegen(AsmBuilder *pBuilder, std::map<std::string, int> &
                                          new MachineOperand(MachineOperand::VREG, getVRegister()),
                                          new MachineOperand(MachineOperand::LABEL, this->src->get_Ref().substr(1)));
         pBuilder->getBlock()->insertInst(la);
-//        cout << ((Symbol*)this->src)->symbolType->type << endl;
-        if(((Symbol*)this->src)->symbolType->type == 1){
-//            源操作数是i32
-            auto lw = new LoadMInstruction(pBuilder->getBlock(),
+        
+        // 增加对 Symbol 类型转换的安全检查
+        Symbol* srcSym = dynamic_cast<Symbol*>(this->src);
+        if (srcSym && srcSym->symbolType) {
+//            cout << srcSym->symbolType->type << endl;
+            if(srcSym->symbolType->type == 1){ // INT32TYPE
+//                源操作数是i32
+                auto lw = new LoadMInstruction(pBuilder->getBlock(),
+                                               LoadMInstruction::LW,
+                                               new MachineOperand(MachineOperand::VREG, this->dst->get_Ref()),
+                                               new MachineOperand(MachineOperand::IMM, 0),
+                                               new MachineOperand(MachineOperand::VREG, getLastVRegister()));
+                pBuilder->getBlock()->insertInst(lw);
+            } else if(srcSym->symbolType->type == 2){ // FLOATTYPE
+//                是float
+                LoadFloat(pBuilder,this->dst->get_Ref(), getLastVRegister());
+            }
+        } else {
+            // 如果转换失败或类型为空，默认按 i32 处理 (fallback)
+             auto lw = new LoadMInstruction(pBuilder->getBlock(),
                                            LoadMInstruction::LW,
                                            new MachineOperand(MachineOperand::VREG, this->dst->get_Ref()),
                                            new MachineOperand(MachineOperand::IMM, 0),
                                            new MachineOperand(MachineOperand::VREG, getLastVRegister()));
             pBuilder->getBlock()->insertInst(lw);
-        }else if(((Symbol*)this->src)->symbolType->type == 2){
-//            是float
-            LoadFloat(pBuilder,this->dst->get_Ref(), getLastVRegister());
         }
     }
-    //局部变量或参数,从栈中加载
+    // 局部变量或参数,从栈中加载
     else{
         if(RefType(this->src->type) == SYMBOL){
 //        load var from stack
+            // [FIX] 增加安全检查，防止找不到变量导致段错误
             auto offsetIter = offset_table.find(this->src->get_Ref());
-            //指针用ld
-            if(Type_Enum(((Symbol*)this->src)->symbolType->type)==POINTERTYPE){
-                loadFromFP(pBuilder, LoadMInstruction::LD, this->dst->get_Ref(), -16-8-offsetIter->second);
+            if (offsetIter == offset_table.end()) {
+                std::cerr << "[Fatal Error] Variable not found in stack layout: " << this->src->get_Ref() << std::endl;
+                // 为了防止崩溃，临时分配一个假偏移量 (或者直接 assert(false))
+                // 更好的做法是检查为什么 AsmBuilder 没扫描到这个变量
+                assert(false && "Variable missing from stack offset table! Did PhiElimination insert Allocas correctly?");
             }
-            //i32用lw
-            else if(Type_Enum(((Symbol*)this->src)->symbolType->type)==INT32TYPE){
-                loadFromFP(pBuilder, LoadMInstruction::LW, this->dst->get_Ref(), -16-4-offsetIter->second);
+            int stack_offset = offsetIter->second;
+
+            // 获取符号类型，增加空指针检查
+            Symbol* srcSym = dynamic_cast<Symbol*>(this->src);
+            Type_Enum type = INT32TYPE; // 默认值
+            if (srcSym && srcSym->symbolType) {
+                type = Type_Enum(srcSym->symbolType->type);
             }
-            //float用flw
-            else if(Type_Enum(((Symbol*)this->src)->symbolType->type)==FLOATTYPE){
+
+            // 指针用ld
+            if(type == POINTERTYPE){
+                loadFromFP(pBuilder, LoadMInstruction::LD, this->dst->get_Ref(), -16-8-stack_offset);
+            }
+            // i32用lw
+            else if(type == INT32TYPE){
+                loadFromFP(pBuilder, LoadMInstruction::LW, this->dst->get_Ref(), -16-4-stack_offset);
+            }
+            // float用flw
+            else if(type == FLOATTYPE){
                 // auto flw = new LoadMInstruction(pBuilder->getBlock(),
                 //                                 LoadMInstruction::FLW,
                 //                                 new MachineOperand(MachineOperand::FVREG, this->dst->get_Ref()),
                 //                                 new MachineOperand(MachineOperand::IMM, -16-4-offsetIter->second),
                 //                                 new MachineOperand(MachineOperand::REG, FP));
                 // pBuilder->getBlock()->insertInst(flw);
-                loadFloatFromFP(pBuilder, LoadMInstruction::FLW, this->dst->get_Ref(), -16 - 4 - offsetIter->second);
+                loadFloatFromFP(pBuilder, LoadMInstruction::FLW, this->dst->get_Ref(), -16 - 4 - stack_offset);
             }
         }
-        //指针
+        // 指针
         else if(RefType(this->src->type) == Ptr){
 //            cout << "this->src->type" << endl;
             // auto lw1 = new LoadMInstruction(pBuilder->getBlock(),
@@ -180,7 +237,7 @@ void LoadInstruction::codegen(AsmBuilder *pBuilder, std::map<std::string, int> &
             //                                 new MachineOperand(MachineOperand::IMM, 0),
             //                                 new MachineOperand(MachineOperand::VREG, this->src->get_Ref()));
             // pBuilder->getBlock()->insertInst(lw1);
-            //如果指针指向的浮点变量,则用flw从源操作数寄存器指向的地址处加载浮点数值到目的浮点寄存器
+            // 如果指针指向的浮点变量,则用flw从源操作数寄存器指向的地址处加载浮点数值到目的浮点寄存器
             if (this->dst->type == FloatVar) {
                 auto flw = new LoadMInstruction(pBuilder->getBlock(),
                                                 LoadMInstruction::FLW,
@@ -189,7 +246,7 @@ void LoadInstruction::codegen(AsmBuilder *pBuilder, std::map<std::string, int> &
                                                 new MachineOperand(MachineOperand::VREG, this->src->get_Ref()));
                 pBuilder->getBlock()->insertInst(flw);
             }
-            //如果指针指向的整型变量,则用lw从源操作数寄存器指向的地址处加载整型数值到目的寄存器
+            // 如果指针指向的整型变量,则用lw从源操作数寄存器指向的地址处加载整型数值到目的寄存器
             else {
                 auto lw1 = new LoadMInstruction(pBuilder->getBlock(),
                                                 LoadMInstruction::LW,
@@ -201,11 +258,19 @@ void LoadInstruction::codegen(AsmBuilder *pBuilder, std::map<std::string, int> &
         }
     }
 }
-
 void LoadInstruction::outPut(std::ostream &os) {
-    os << dst->get_Ref() + " = load " + dst->get_TypeName() + ", " + dst->get_TypeName() + '*' + ' ' + src->name + ", align 4" << endl;
-}
+    if (!dst || !src) {
+        std::cerr << "[FATAL] LoadInstruction operands are NULL" << std::endl;
+        return;
+    }
 
+    // Load: %dst = load <ty>, <ty>* %src
+    // <ty> 应该是 dst 的类型
+    std::string typeStr = getTypeNameSafe(dst);
+    
+    os << "\t" << dst->get_Ref() << " = load " << typeStr << ", " 
+       << typeStr << "* " << src->get_Ref() << ", align 4" << std::endl;
+}
 void LoadInstruction::replace(ValueRef *old, ValueRef *now) {
     if(this->src == old) this->src = now;
     if(this->use_list.count(old)) this->use_list.erase(old);
@@ -228,12 +293,13 @@ StoreInstruction::StoreInstruction(ValueRef* dst,ValueRef* src) : IRInstruction(
         addUse(dst); // value is stored in dst, we addUse to avoid be deleted in DCE
     }
 }
+// src/IRInstruction.cpp
 
 void StoreInstruction::codegen(AsmBuilder *pBuilder, std::map<std::string, int> &offset_table,
                                std::map<std::string, int> &size_table, int frameSize) {
 //    cout << this->dst->get_Ref() << endl;
     if(this->dst->get_Ref()[0] == '@'){
-        //            high
+        // Global Variable handling (unchanged)
         auto liAddress = new LoadImmInstruction(pBuilder->getBlock(),
                                                 LoadImmInstruction::LUI,
                                                 new MachineOperand(MachineOperand::VREG, getVRegister()),
@@ -282,6 +348,7 @@ void StoreInstruction::codegen(AsmBuilder *pBuilder, std::map<std::string, int> 
             pBuilder->getBlock()->insertInst(fstore);
         }
     } else{
+        // Local Variable / Stack handling
         if(RefType(this->src->type) == IntConst){
 //        cout << "intConst" << endl;
             loadImmIntoReg(pBuilder, strtol(this->src->get_Ref().c_str(), nullptr, 10));
@@ -294,7 +361,12 @@ void StoreInstruction::codegen(AsmBuilder *pBuilder, std::map<std::string, int> 
                 pBuilder->getBlock()->insertInst(sw);
             }
             else{
+                // [FIX 1] IntConst -> Stack
                 auto offsetIter = offset_table.find(this->dst->get_Ref());
+                if (offsetIter == offset_table.end()) {
+                    std::cerr << "[Store Error] Variable not found: " << this->dst->get_Ref() << std::endl;
+                    assert(false && "Stack variable missing in StoreInstruction");
+                }
                 storeToStack(pBuilder, StoreMInstruction::SW, getLastVRegister(), - 20 - offsetIter->second);
             }
         }else if(RefType(this->src->type) == IntVar){
@@ -308,12 +380,22 @@ void StoreInstruction::codegen(AsmBuilder *pBuilder, std::map<std::string, int> 
                 pBuilder->getBlock()->insertInst(sw);
             }
             else{
+                // [FIX 2] IntVar -> Stack
                 auto offsetIter = offset_table.find(this->dst->get_Ref());
+                if (offsetIter == offset_table.end()) {
+                    std::cerr << "[Store Error] Variable not found: " << this->dst->get_Ref() << std::endl;
+                    assert(false && "Stack variable missing in StoreInstruction");
+                }
                 storeToStack(pBuilder, StoreMInstruction::SW, this->src->get_Ref(), - 20 - offsetIter->second);
             }
         }else if(RefType(this->src->type) == Ptr){
 //            cout << "ptr" << endl; in args
+            // [FIX 3] Ptr -> Stack
             auto offsetIter = offset_table.find(this->dst->get_Ref());
+            if (offsetIter == offset_table.end()) {
+                std::cerr << "[Store Error] Variable not found: " << this->dst->get_Ref() << std::endl;
+                assert(false && "Stack variable missing in StoreInstruction");
+            }
             storeToStack(pBuilder, StoreMInstruction::SD, this->src->get_Ref(), - 16 - 8 - offsetIter->second);
         }else if(RefType(this->src->type) == FloatConst){
             isFloatConst(this->src);
@@ -328,13 +410,12 @@ void StoreInstruction::codegen(AsmBuilder *pBuilder, std::map<std::string, int> 
                 pBuilder->getBlock()->insertInst(fsw);
             }
             else{
+                // [FIX 4] FloatConst -> Stack
                 auto offsetIter = offset_table.find(this->dst->get_Ref());
-                // auto fsw = new StoreMInstruction(pBuilder->getBlock(),
-                //                                  StoreMInstruction::FSW,
-                //                                  new MachineOperand(MachineOperand::FVREG, getLastFVRegister()),
-                //                                  new MachineOperand(MachineOperand::IMM, -20-offsetIter->second),
-                //                                  new MachineOperand(MachineOperand::REG,FP));
-                // pBuilder->getBlock()->insertInst(fsw);
+                if (offsetIter == offset_table.end()) {
+                    std::cerr << "[Store Error] Variable not found: " << this->dst->get_Ref() << std::endl;
+                    assert(false && "Stack variable missing in StoreInstruction");
+                }
                 storeFloatToStack(pBuilder, StoreMInstruction::FSW, getLastFVRegister(), -20 - offsetIter->second);
             }
         }else if(RefType(this->src->type) == FloatVar){
@@ -347,30 +428,32 @@ void StoreInstruction::codegen(AsmBuilder *pBuilder, std::map<std::string, int> 
                 pBuilder->getBlock()->insertInst(fsw);
             }
             else{
+                // [FIX 5] FloatVar -> Stack
                 auto offsetIter = offset_table.find(this->dst->get_Ref());
-                // auto fsw = new StoreMInstruction(pBuilder->getBlock(),
-                //                                  StoreMInstruction::FSW,
-                //                                  new MachineOperand(MachineOperand::FVREG, this->src->get_Ref()),
-                //                                  new MachineOperand(MachineOperand::IMM, -20-offsetIter->second),
-                //                                  new MachineOperand(MachineOperand::REG,FP));
-                // pBuilder->getBlock()->insertInst(fsw);
+                if (offsetIter == offset_table.end()) {
+                    std::cerr << "[Store Error] Variable not found: " << this->dst->get_Ref() << std::endl;
+                    assert(false && "Stack variable missing in StoreInstruction");
+                }
                 storeFloatToStack(pBuilder, StoreMInstruction::FSW, this->src->get_Ref(), -20 - offsetIter->second);
             }
         }
     }
-}
-
-void StoreInstruction::outPut(std::ostream &os) {
-    if(dst->type == SYMBOL){
-        Type* eleType = dynamic_cast<Symbol*>(dst)->symbolType;
-        os << "store " + eleType->getTypeName() + ' ' + src->get_Ref() + ", " + eleType->getTypeName() + "* " + dst->name + ", align 4" << endl;
+}void StoreInstruction::outPut(std::ostream &os) {
+    if (!dst || !src) {
+        std::cerr << "[FATAL] StoreInstruction operands are NULL" << std::endl;
+        return;
     }
-    else{ //dst->type == Ptr
-        PointerType *p = dynamic_cast<Pointer*>(dst)->pointerType;
-        os << "store " + p->elementType->getTypeName() + ' ' + src->get_Ref() + ", " + p->getTypeName() + ' ' + dst->name + ", align 4" << endl;
-    }
-}
 
+    // Store: store <ty> %src, <ty>* %dst
+    // <ty> 是要存储的值(src)的类型
+    std::string valTypeStr = getTypeNameSafe(src);
+    
+    // dst 是指针，它的类型应该是 valTypeStr + "*"
+    // 但为了保险，我们只在指令中打印 valTypeStr* // 标准格式: store i32 %val, i32* %ptr
+    
+    os << "\tstore " << valTypeStr << " " << src->get_Ref() << ", " 
+       << valTypeStr << "* " << dst->get_Ref() << ", align 4" << std::endl;
+}
 void StoreInstruction::replace(ValueRef *old, ValueRef *now) {
     if(this->src == old) this->src = now;
     if(this->dst == old) this->dst = now;
@@ -1720,3 +1803,11 @@ void SraInstruction::codegen(AsmBuilder *pBuilder, map<std::string, int> &offset
                                           new MachineOperand(MachineOperand::IMM, strtol(this->bits->get_Ref().c_str(), nullptr, 10)));
         pBuilder->getBlock()->insertInst(sai);
 }
+
+
+void AllocaInstruction::outPut(std::ostream &os) {
+    
+    os << "\t" << dst->get_Ref() << " = alloca " << varType->getTypeName() << ", align 4" << std::endl;
+}
+
+

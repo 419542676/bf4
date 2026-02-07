@@ -1,41 +1,47 @@
-#ifndef COMPILER_SCALAROPTS_H
-#define COMPILER_SCALAROPTS_H
+#ifndef BIFANG_SCALAROPTS_H
+#define BIFANG_SCALAROPTS_H
 
 #include "GlobalUnit.h"
-#include "Function.h"
-#include "BasicBlock.h"
+#include "Instruction.h"
 #include "IRInstruction.h"
 #include <vector>
 
 class ScalarOpts {
-public:
+private:
     GlobalUnit* globalUnit;
-    bool changed; // 标记优化是否发生了改变
 
-    ScalarOpts(GlobalUnit* gu) : globalUnit(gu), changed(false) {}
+    // 辅助：判断指令是否有副作用
+    bool hasSideEffects(Instruction* inst);
 
-    // 1. 常量传播与折叠 (Constant Propagation & Folding)
-    // 能够计算 1+2=3, 3*4=12 等
+    // 辅助：从操作数的 use 链中移除当前指令
+    void removeUseFromOperands(Instruction* inst);
+
+    // 辅助：执行整数二元运算
+    int computeInt(binaryType op, int v1, int v2);
+
+    // 辅助：执行整数比较运算
+    // [修改] 使用正确的 cmpType
+    int computeCmp(cmpType op, int v1, int v2);
+
+public:
+    bool changed = false; 
+
+    ScalarOpts(GlobalUnit* gu) : globalUnit(gu) {}
+
+    // 1. 常量传播
     void runConstantPropagation();
 
-    // 2. 代数化简 (Algebraic Simplification)
-    // 能够优化 x+0=x, x*1=x, x*0=0 等
+    // 2. 代数化简
     void runAlgebraicSimplification();
 
-    // 3. 简单的死代码消除 (Simple Dead Code Elimination)
-    // 移除计算结果未被使用的无副作用指令
+    // 3. 死代码消除
     void runDeadCodeElimination();
-
-    // 4. 控制流简化 (CFG Simplification)
-    // 将条件确定的 CondBr 转换为 Br
-    void runCFGSimplification();
+    
+    // 4. Store-Load 转发 (占位)
     void runStoreLoadForwarding();
-
-private:
-    // 辅助函数：尝试计算两个常量的二元运算
-    ValueRef* computeBinary(binaryType op, ValueRef* v1, ValueRef* v2);
-    // 辅助函数：尝试计算两个常量的比较运算
-    ValueRef* computeCmp(cmpType op, ValueRef* v1, ValueRef* v2);
+    
+    // 5. CFG 简化 (占位)
+    void runCFGSimplification();
 };
 
-#endif
+#endif //BIFANG_SCALAROPTS_H

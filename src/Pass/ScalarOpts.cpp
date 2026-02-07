@@ -1,266 +1,241 @@
 #include "Pass/ScalarOpts.h"
-#include "ValueRef.h"
-#include "Instruction.h"
-#include "IRInstruction.h"
+#include "ValueRef.h"      // 包含 Int_Const 等定义
+#include "IRInstruction.h" // 包含 BinaryInstruction 等定义
 #include <iostream>
 #include <vector>
-#include <map>
-#include <set>
-#include <algorithm> // 必须包含
+#include <algorithm> // for std::remove
 
-// 辅助函数定义
-bool isIntConst(ValueRef* v) { return v && v->type == RefType::IntConst; }
-int getIntVal(ValueRef* v) { return dynamic_cast<Int_Const*>(v)->value; }
-bool isBoolConst(ValueRef* v) { return v && v->type == RefType::BoolConst; }
-int getBoolVal(ValueRef* v) { return dynamic_cast<Bool_Const*>(v)->value ? 1 : 0; }
+// =========================================================
+// 1. 适配层：根据 ValueRef.h 定制的辅助函数
+// =========================================================
 
-// --- 1. 存储-加载转发 (Load-Store Forwarding) ---
-void ScalarOpts::runStoreLoadForwarding() {
-    for (auto& [name, func] : globalUnit->func_table) {
-        for (auto block : func->block_list) {
-            std::map<ValueRef*, ValueRef*> memoryMap;
+// 判断是否为整数常量，并获取值
+static bool getIntValue(ValueRef* val, int& value) {
+    if (!val) return false;
+    
+    // 使用 dynamic_cast 转换为 Int_Const 子类
+    if (auto c = dynamic_cast<Int_Const*>(val)) {
+        value = c->value; // 访问 Int_Const 的 value 成员
+        return true;
+    }
+    return false;
+}
 
-            for (auto inst : block->local_instr) {
-                if (inst->deleted) continue;
+// 创建一个新的整数常量
+static ValueRef* createIntConst(int value) {
+    // 调用 Int_Const 的构造函数
+    return new Int_Const(value);
+}
 
-                if (inst->instType == InstType_Enum::STORE) {
-                    auto storeInst = dynamic_cast<StoreInstruction*>(inst);
-                    // 记录：地址(dst) -> 值(src)
-                    memoryMap[storeInst->dst] = storeInst->src;
-                }
-                else if (inst->instType == InstType_Enum::LOAD) {
-                    auto loadInst = dynamic_cast<LoadInstruction*>(inst);
-                    ValueRef* ptr = loadInst->src; // 源地址
-                    ValueRef* dst = loadInst->dst; // 目标寄存器
+// =========================================================
+// 2. 核心逻辑实现
+// =========================================================
 
-                    if (memoryMap.count(ptr)) {
-                        ValueRef* knownVal = memoryMap[ptr];
-                        // 替换所有使用该 Load 结果的地方
-                        std::vector<Instruction*> users = dst->use;
-                        for (auto user : users) {
-                            user->replace(dst, knownVal);
-                        }
-                        inst->deleted = true;
-                        this->changed = true;
-                    }
-                }
-                else if (inst->instType == InstType_Enum::CALL) {
-                    memoryMap.clear(); // 函数调用可能修改内存，清空缓存
-                }
-            }
-        }
+bool ScalarOpts::hasSideEffects(Instruction* inst) {
+    // Store, Call, Ret, Br, CondBr 都有副作用或控制流作用，不能直接删
+    if (inst->instType == InstType_Enum::STORE) return true;
+    if (inst->instType == InstType_Enum::CALL) return true;
+    if (inst->instType == InstType_Enum::RET) return true;
+    if (inst->instType == InstType_Enum::BR) return true;
+    if (inst->instType == InstType_Enum::CONDBR) return true;
+    return false;
+}
+
+// 从操作数的 use 链中移除当前指令 (用于 DCE)
+void ScalarOpts::removeUseFromOperands(Instruction* inst) {
+    auto removeFromList = [&](ValueRef* val) {
+        if (!val) return;
+        auto& uses = val->use;
+        // 使用 erase-remove idiom 删除指定的 inst
+        uses.erase(std::remove(uses.begin(), uses.end(), inst), uses.end());
+    };
+
+    // 1. 二元运算
+    if (auto bin = dynamic_cast<BinaryInstruction*>(inst)) {
+        removeFromList(bin->src1);
+        removeFromList(bin->src2);
+    }
+    // 2. 比较运算
+    else if (auto cmp = dynamic_cast<CmpInstruction*>(inst)) {
+        removeFromList(cmp->src1);
+        removeFromList(cmp->src2);
+    }
+    // 3. Load
+    else if (auto load = dynamic_cast<LoadInstruction*>(inst)) {
+        removeFromList(load->src);
+    }
+    // 4. 其他指令 (如有 Zext, Bitcast 等根据需要添加)
+}
+
+int ScalarOpts::computeInt(binaryType op, int v1, int v2) {
+    switch (op) {
+        case ADD: return v1 + v2;
+        case SUB: return v1 - v2;
+        case MUL: return v1 * v2;
+        case DIV: return (v2 != 0) ? (v1 / v2) : 0; 
+        case MOD: return (v2 != 0) ? (v1 % v2) : 0;
+        case AND: return v1 & v2;
+        case OR:  return v1 | v2;
+        default: return 0;
     }
 }
 
-// --- 2. 常量传播与折叠 ---
+int ScalarOpts::computeCmp(cmpType op, int v1, int v2) {
+    switch (op) {
+        case EQ: return v1 == v2;
+        case NE: return v1 != v2;
+        case GT: return v1 > v2;
+        case GE: return v1 >= v2;
+        case LT: return v1 < v2;
+        case LE: return v1 <= v2;
+        default: return 0;
+    }
+}
+
+// =========================================================
+// 3. 常量传播 Pass
+// =========================================================
 void ScalarOpts::runConstantPropagation() {
     for (auto& [name, func] : globalUnit->func_table) {
-        for (auto block : func->block_list) {
-            for (auto inst : block->local_instr) {
-                if (inst->deleted) continue;
+        for (auto bb : func->block_list) {
+            for (auto it = bb->local_instr.begin(); it != bb->local_instr.end(); ) {
+                Instruction* inst = *it;
+                bool replaced = false;
 
-                // Case A: 二元运算
-                if (inst->instType == InstType_Enum::BINARY) {
-                    auto binInst = dynamic_cast<BinaryInstruction*>(inst);
-                    if (isIntConst(binInst->src1) && isIntConst(binInst->src2)) {
-                        ValueRef* newVal = computeBinary(binInst->opTy, binInst->src1, binInst->src2);
-                        if (newVal) {
-                            std::vector<Instruction*> users = binInst->dst->use;
-                            for (auto user : users) user->replace(binInst->dst, newVal);
-                            inst->deleted = true;
-                            this->changed = true;
+                // --- 二元运算 ---
+                if (auto bin = dynamic_cast<BinaryInstruction*>(inst)) {
+                    int v1, v2;
+                    if (getIntValue(bin->src1, v1) && getIntValue(bin->src2, v2)) {
+                        // [修改] 使用 bin->opTy
+                        int res = computeInt(bin->opTy, v1, v2);
+                        ValueRef* newConst = createIntConst(res);
+                        
+                        if (!inst->def_list.empty()) {
+                            ValueRef* defVal = *inst->def_list.begin();
+                            std::vector<Instruction*> users = defVal->use; 
+                            for(auto user : users) {
+                                user->replace(defVal, newConst);
+                            }
                         }
+                        
+                        removeUseFromOperands(inst);
+                        it = bb->local_instr.erase(it);
+                        replaced = true;
+                        changed = true;
                     }
                 }
-                // Case B: 比较运算
-                else if (inst->instType == InstType_Enum::CMP) {
-                    auto cmpInst = dynamic_cast<CmpInstruction*>(inst);
-                    if (isIntConst(cmpInst->src1) && isIntConst(cmpInst->src2)) {
-                        ValueRef* newVal = computeCmp(cmpInst->opTy, cmpInst->src1, cmpInst->src2);
-                        if (newVal) {
-                            std::vector<Instruction*> users = cmpInst->result->use;
-                            for (auto user : users) user->replace(cmpInst->result, newVal);
-                            inst->deleted = true;
-                            this->changed = true;
+                // --- 比较运算 ---
+                else if (auto cmp = dynamic_cast<CmpInstruction*>(inst)) {
+                    int v1, v2;
+                    if (getIntValue(cmp->src1, v1) && getIntValue(cmp->src2, v2)) {
+                        // [修改] 使用 cmp->opTy
+                        int res = computeCmp(cmp->opTy, v1, v2);
+                        ValueRef* newConst = createIntConst(res); // 1 或 0
+                        
+                        if (!inst->def_list.empty()) {
+                            ValueRef* defVal = *inst->def_list.begin();
+                            std::vector<Instruction*> users = defVal->use;
+                            for(auto user : users) user->replace(defVal, newConst);
                         }
+                        
+                        removeUseFromOperands(inst);
+                        it = bb->local_instr.erase(it);
+                        replaced = true;
+                        changed = true;
                     }
                 }
-                // Case C: 零扩展 (ZExtInstruction)
-                else if (inst->instType == InstType_Enum::ZEXT) {
-                    auto zextInst = dynamic_cast<ZExtInstruction*>(inst); 
-                    if (isIntConst(zextInst->src)) {
-                        int val = getIntVal(zextInst->src);
-                        ValueRef* newVal = new Int_Const(val);
-                        std::vector<Instruction*> users = zextInst->dst->use;
-                        for (auto user : users) user->replace(zextInst->dst, newVal);
-                        inst->deleted = true;
-                        this->changed = true;
-                    }
-                }
-                // Case D: 异或 (Xor) 
-                else if (inst->instType == InstType_Enum::XOR) {
-                     auto xorInst = dynamic_cast<XorInstruction*>(inst);
-                     if (isIntConst(xorInst->src)) {
-                        int val = getIntVal(xorInst->src);
-                        int res = val ^ 1; // 常量折叠：对值取反
-                        ValueRef* newVal = new Int_Const(res);
-                        std::vector<Instruction*> users = xorInst->dst->use;
-                        for (auto user : users) user->replace(xorInst->dst, newVal);
-                        inst->deleted = true;
-                        this->changed = true;
-                     }
+
+                if (!replaced) {
+                    ++it;
                 }
             }
         }
     }
 }
 
-// 计算逻辑
-ValueRef* ScalarOpts::computeBinary(binaryType op, ValueRef* v1, ValueRef* v2) {
-    int val1 = getIntVal(v1);
-    int val2 = getIntVal(v2);
-    int res = 0;
-    if ((op == DIV || op == MOD) && val2 == 0) return nullptr;
-    switch (op) {
-        case ADD: res = val1 + val2; break;
-        case SUB: res = val1 - val2; break;
-        case MUL: res = val1 * val2; break;
-        case DIV: res = val1 / val2; break;
-        case MOD: res = val1 % val2; break;
-        case AND: res = (val1 && val2); break;
-        case OR:  res = (val1 || val2); break;
-        default: return nullptr;
-    }
-    return new Int_Const(res);
-}
-
-ValueRef* ScalarOpts::computeCmp(cmpType op, ValueRef* v1, ValueRef* v2) {
-    int val1 = getIntVal(v1);
-    int val2 = getIntVal(v2);
-    int res = 0;
-    switch (op) {
-        case EQ: res = (val1 == val2); break;
-        case NE: res = (val1 != val2); break;
-        case LT: res = (val1 < val2); break;
-        case LE: res = (val1 <= val2); break;
-        case GT: res = (val1 > val2); break;
-        case GE: res = (val1 >= val2); break;
-        default: return nullptr;
-    }
-    return new Int_Const(res);
-}
-
-// --- 3. 代数化简 ---
+// =========================================================
+// 4. 代数化简 Pass
+// =========================================================
 void ScalarOpts::runAlgebraicSimplification() {
     for (auto& [name, func] : globalUnit->func_table) {
-        for (auto block : func->block_list) {
-            for (auto inst : block->local_instr) {
-                if (inst->deleted || inst->instType != InstType_Enum::BINARY) continue;
-                auto binInst = dynamic_cast<BinaryInstruction*>(inst);
-                ValueRef* replaceVal = nullptr;
-                ValueRef* op1 = binInst->src1;
-                ValueRef* op2 = binInst->src2;
-
-                if (binInst->opTy == ADD) {
-                    if (isIntConst(op2) && getIntVal(op2) == 0) replaceVal = op1;
-                    else if (isIntConst(op1) && getIntVal(op1) == 0) replaceVal = op2;
-                }
-                else if (binInst->opTy == MUL) {
-                    if (isIntConst(op2) && getIntVal(op2) == 1) replaceVal = op1;
-                    else if (isIntConst(op1) && getIntVal(op1) == 1) replaceVal = op2;
-                    else if (isIntConst(op2) && getIntVal(op2) == 0) replaceVal = new Int_Const(0);
-                    else if (isIntConst(op1) && getIntVal(op1) == 0) replaceVal = new Int_Const(0);
-                }
-                if (replaceVal) {
-                    std::vector<Instruction*> users = binInst->dst->use;
-                    for (auto user : users) user->replace(binInst->dst, replaceVal);
-                    inst->deleted = true;
-                    this->changed = true;
-                }
-            }
-        }
-    }
-}
-
-// --- 4. 死代码消除 (增强版：包含指令DCE和块DCE) ---
-void ScalarOpts::runDeadCodeElimination() {
-    for (auto& [name, func] : globalUnit->func_table) {
-        
-        // A. 指令级死代码消除
-        for (auto block : func->block_list) {
-            auto it = block->local_instr.begin();
-            while (it != block->local_instr.end()) {
+        for (auto bb : func->block_list) {
+            for (auto it = bb->local_instr.begin(); it != bb->local_instr.end(); ) {
                 Instruction* inst = *it;
-                if (inst->deleted) {
-                    it = block->local_instr.erase(it);
-                    this->changed = true;
-                    continue;
-                }
-                
-                bool hasSideEffect = (
-                    inst->instType == InstType_Enum::STORE || 
-                    inst->instType == InstType_Enum::CALL ||
-                    inst->instType == InstType_Enum::RET ||
-                    inst->instType == InstType_Enum::BR ||
-                    inst->instType == InstType_Enum::CONDBR
-                );
+                bool simplified = false;
 
-                if (!hasSideEffect) {
-                    bool isUsed = false;
-                    for (auto defVal : inst->def_list) {
-                        if (!defVal->use.empty()) {
-                            isUsed = true;
-                            break;
-                        }
-                    }
-                    if (!isUsed) {
-                        inst->deleted = true;
-                        it = block->local_instr.erase(it);
-                        this->changed = true;
-                        continue;
-                    }
-                }
-                ++it;
-            }
-        }
-
-        // B. [关键新增] 基本块级死代码消除
-        // 移除那些“无前驱”且“非入口”的基本块
-        bool blockChanged = true;
-        while(blockChanged) {
-            blockChanged = false;
-            auto it = func->block_list.begin();
-            while (it != func->block_list.end()) {
-                BasicBlock* block = *it;
-                
-                // 如果块没有前驱，并且不是函数的入口块 -> 它是不可达的死块
-                if (block->pred.empty() && block != func->entry) {
+                if (auto bin = dynamic_cast<BinaryInstruction*>(inst)) {
+                    ValueRef* src1 = bin->src1;
+                    ValueRef* src2 = bin->src2;
+                    int v1 = 0, v2 = 0;
+                    bool isC1 = getIntValue(src1, v1);
+                    bool isC2 = getIntValue(src2, v2);
                     
-                    // 1. 维护图连接：通知所有后继，我们要消失了
-                    for (auto succ : block->succ) {
-                        auto& preds = succ->pred;
-                        // 从后继的前驱列表中移除当前块
-                        preds.erase(std::remove(preds.begin(), preds.end(), block), preds.end());
+                    ValueRef* defVal = inst->def_list.empty() ? nullptr : *inst->def_list.begin();
+
+                    if (defVal) {
+                        // [修改] 使用 bin->opTy
                         
-                        // [关键修复] 同时要清理后继块 Phi 节点中关于当前块的引用
-                        // 否则后继块的 Phi 会指向一个已经删除的块 (Zombie Phi)
-                        for (auto inst : succ->local_instr) {
-                            if (inst->instType == InstType_Enum::PHI) {
-                                auto phi = dynamic_cast<PhiInstruction*>(inst);
-                                if (phi->mp.count(block)) {
-                                    phi->mp.erase(block);
+                        // 规则 1: x + 0 = x
+                        if (bin->opTy == ADD) {
+                            if (isC2 && v2 == 0) {
+                                std::vector<Instruction*> users = defVal->use;
+                                for(auto user : users) user->replace(defVal, src1);
+                                simplified = true;
+                            } else if (isC1 && v1 == 0) {
+                                std::vector<Instruction*> users = defVal->use;
+                                for(auto user : users) user->replace(defVal, src2);
+                                simplified = true;
+                            }
+                        }
+                        // 规则 2: x - 0 = x
+                        else if (bin->opTy == SUB) {
+                            if (isC2 && v2 == 0) {
+                                std::vector<Instruction*> users = defVal->use;
+                                for(auto user : users) user->replace(defVal, src1);
+                                simplified = true;
+                            }
+                            // 规则 3: x - x = 0
+                            else if (src1 == src2) {
+                                ValueRef* zero = createIntConst(0);
+                                std::vector<Instruction*> users = defVal->use;
+                                for(auto user : users) user->replace(defVal, zero);
+                                simplified = true;
+                            }
+                        }
+                        // 规则 4: x * 1 = x; x * 0 = 0
+                        else if (bin->opTy == MUL) {
+                            if (isC2) {
+                                if (v2 == 1) { // x * 1 = x
+                                    std::vector<Instruction*> users = defVal->use;
+                                    for(auto user : users) user->replace(defVal, src1);
+                                    simplified = true;
+                                } else if (v2 == 0) { // x * 0 = 0
+                                    ValueRef* zero = createIntConst(0);
+                                    std::vector<Instruction*> users = defVal->use;
+                                    for(auto user : users) user->replace(defVal, zero);
+                                    simplified = true;
                                 }
-                            } else {
-                                break; // Phi 必定在 Block 开头
+                            }
+                             else if (isC1) { 
+                                if (v1 == 1) { // 1 * x = x
+                                    std::vector<Instruction*> users = defVal->use;
+                                    for(auto user : users) user->replace(defVal, src2);
+                                    simplified = true;
+                                } else if (v1 == 0) { // 0 * x = 0
+                                    ValueRef* zero = createIntConst(0);
+                                    std::vector<Instruction*> users = defVal->use;
+                                    for(auto user : users) user->replace(defVal, zero);
+                                    simplified = true;
+                                }
                             }
                         }
                     }
-                    
-                    // 2. 从函数的基本块列表中真正移除
-                    it = func->block_list.erase(it);
-                    
-                    this->changed = true;
-                    blockChanged = true; // 删了一个块，可能导致它的后继也变成死块，需要继续扫描
+                }
+
+                if (simplified) {
+                    removeUseFromOperands(inst);
+                    it = bb->local_instr.erase(it);
+                    changed = true;
                 } else {
                     ++it;
                 }
@@ -269,71 +244,42 @@ void ScalarOpts::runDeadCodeElimination() {
     }
 }
 
-// 5. 控制流简化 (维护 CFG 图连接) ---
-void ScalarOpts::runCFGSimplification() {
-    for (auto& [name, func] : globalUnit->func_table) {
-        for (auto block : func->block_list) {
-            if (block->local_instr.empty()) continue;
-            Instruction* terminator = block->local_instr.back();
-
-            if (terminator->instType == InstType_Enum::CONDBR) {
-                auto condBr = dynamic_cast<CondBrInstruction*>(terminator);
-                
-                // 统一获取条件值 (支持 IntConst 和 BoolConst)
-                bool isConstant = false;
-                bool conditionIsTrue = false;
-
-                if (isIntConst(condBr->condition)) {
-                    isConstant = true;
-                    conditionIsTrue = (getIntVal(condBr->condition) != 0);
-                } 
-                else if (isBoolConst(condBr->condition)) { 
-                    isConstant = true;
-                    conditionIsTrue = (getBoolVal(condBr->condition) != 0);
-                }
-
-                if (isConstant) {
-                    BasicBlock* takenBlock = conditionIsTrue ? condBr->trueLabel : condBr->falseLabel;
-                    BasicBlock* notTakenBlock = conditionIsTrue ? condBr->falseLabel : condBr->trueLabel;
-
-                    // 1. 创建新的无条件跳转
-                    auto newBr = new BrInstruction(takenBlock);
-                    newBr->block = block;
+// =========================================================
+// 5. 死代码消除 Pass
+// =========================================================
+void ScalarOpts::runDeadCodeElimination() {
+    bool localChanged = true;
+    while (localChanged) {
+        localChanged = false;
+        
+        for (auto& [name, func] : globalUnit->func_table) {
+            for (auto bb : func->block_list) {
+                for (auto it = bb->local_instr.begin(); it != bb->local_instr.end(); ) {
+                    Instruction* inst = *it;
                     
-                    // 2. 替换指令
-                    block->local_instr.pop_back();
-                    block->local_instr.push_back(newBr);
-                    terminator->deleted = true;
-
-                    // 3. 维护 CFG 图结构 (关键修复：防止同一目标块被错误断开)
-                    // 只有当“走的分支”和“不走的分支”不是同一个块时，才断开与“不走分支”的连接
-                    if (takenBlock != notTakenBlock) {
-                        // 从当前块的后继中移除 notTakenBlock
-                        auto& succs = block->succ;
-                        succs.erase(std::remove(succs.begin(), succs.end(), notTakenBlock), succs.end());
-
-                        // 从 notTakenBlock 的前驱中移除当前块
-                        auto& preds = notTakenBlock->pred;
-                        preds.erase(std::remove(preds.begin(), preds.end(), block), preds.end());
-
-                        // [关键修复] 处理“僵尸 Phi”
-                        // 既然切断了 block -> notTakenBlock 的边，那么 notTakenBlock 里的 Phi 节点
-                        // 就不应该再从 block 获取值了。必须从 map 中删除该条目。
-                        for (auto inst : notTakenBlock->local_instr) {
-                            if (inst->instType == InstType_Enum::PHI) {
-                                auto phi = dynamic_cast<PhiInstruction*>(inst);
-                                if (phi->mp.count(block)) {
-                                    phi->mp.erase(block);
-                                }
-                            } else {
-                                break; // Phi 必定在 Block 开头
+                    if (!hasSideEffects(inst)) {
+                        bool used = false;
+                        if (!inst->def_list.empty()) {
+                            ValueRef* def = *inst->def_list.begin();
+                            if (!def->use.empty()) {
+                                used = true;
                             }
                         }
+                        
+                        if (!used) {
+                            removeUseFromOperands(inst);
+                            it = bb->local_instr.erase(it);
+                            localChanged = true;
+                            changed = true;
+                            continue;
+                        }
                     }
-
-                    this->changed = true;
+                    ++it;
                 }
             }
         }
     }
 }
+
+void ScalarOpts::runStoreLoadForwarding() {}
+void ScalarOpts::runCFGSimplification() {}

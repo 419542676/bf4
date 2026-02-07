@@ -3,77 +3,88 @@ main:
 	sd ra, -8(sp)				# 0
 	sd fp, -16(sp)				# 1
 	add fp, sp, zero				# 2
-	addi sp, sp, -128				# 3
+	addi sp, sp, -112				# 3
 	sd s1, 0(sp)
 	j  if.then10				# 4
 
 if.then10:
-	li t0, 100				# 5
-	sw t0, -48(fp)				# 6
+	li t1, 100				# 8
+	sw t1, -48(fp)				# 9
+	j  if.end12				# 10
+
+if.else11:
+	li t1, 999				# 5
+	sw t1, -48(fp)				# 6
 	j  if.end12				# 7
 
 if.end12:
-	ld t0, -52(fp)				# 8
-	j  whileCond13				# 9
+	lw t1, -48(fp)				# 11
+	j  whileCond13				# 12
 
 whileCond13:
-	li t1, 0				# 10
-	sw t1, -56(fp)				# 11
-	li t1, 0				# 12
-	sw t1, -64(fp)				# 13
-	j  doWhileBody14				# 14
+	andi t2, t0, 1				# 13
+	xori t0, t2, 0				# 14
+	sltu t2, zero, t0				# 15
+	li t0, 0				# 16
+	sw t0, -52(fp)				# 17
+	li t0, 0				# 18
+	sw t0, -56(fp)				# 19
+	li t0, 0				# 20
+	sw t0, -64(fp)				# 21
+	bne t2, zero, doWhileBody14				# 22
+	j  whileNext16				# 23
 
 doWhileBody14:
-	ld t1, -60(fp)				# 15
-	ld t2, -68(fp)				# 16
-	addi t3, t1, 200				# 17
-	li t1, 5				# 18
-	slt t4, t2, t1				# 19
-	andi t1, t4, 1				# 20
-	xori t4, t1, 0				# 21
-	sltu t1, zero, t4				# 22
-	bne t1, zero, if.then19				# 23
-	j  if.else20				# 24
+	lw t2, -52(fp)				# 24
+	lw t0, -56(fp)				# 25
+	addi t3, t2, 200				# 26
+	li t2, 5				# 27
+	slt t4, t0, t2				# 28
+	andi t2, t4, 1				# 29
+	xori t4, t2, 0				# 30
+	sltu t2, zero, t4				# 31
+	bne t2, zero, if.then19				# 32
+	j  if.else20				# 33
 
 if.then19:
-	addi t1, t3, 1				# 28
-	sw t1, -72(fp)				# 29
-	j  if.end21				# 30
+	addi t2, t3, 1				# 37
+	sw t2, -60(fp)				# 38
+	j  if.end21				# 39
 
 if.else20:
-	addi t1, t3, 2				# 25
-	sw t1, -72(fp)				# 26
-	j  if.end21				# 27
+	addi t2, t3, 2				# 34
+	sw t2, -60(fp)				# 35
+	j  if.end21				# 36
 
 if.end21:
-	ld t1, -76(fp)				# 31
-	addi t3, t2, 1				# 32
-	j  doWhileCond15				# 33
+	lw t2, -60(fp)				# 40
+	addi t3, t0, 1				# 41
+	j  doWhileCond15				# 42
 
 doWhileCond15:
-	li t2, 10				# 34
-	slt t4, t3, t2				# 35
-	andi t2, t4, 1				# 36
-	xori t4, t2, 0				# 37
-	sltu t2, zero, t4				# 38
-	sw t1, -56(fp)				# 39
-	sw t3, -64(fp)				# 40
-	sw t1, -80(fp)				# 41
-	bne t2, zero, doWhileBody14				# 42
-	j  whileNext16				# 43
+	li t0, 10				# 43
+	slt t4, t3, t0				# 44
+	andi t0, t4, 1				# 45
+	xori t4, t0, 0				# 46
+	sltu t0, zero, t4				# 47
+	sw t2, -52(fp)				# 48
+	sw t3, -56(fp)				# 49
+	sw t2, -64(fp)				# 50
+	bne t0, zero, doWhileBody14				# 51
+	j  whileNext16				# 52
 
 whileNext16:
-	ld t2, -84(fp)				# 44
-	addw t1, t0, t2				# 45
-	li t0, -2100				# 46
-	add t2, t1, t0				# 47
-	j  mainRet0				# 48
+	lw t0, -64(fp)				# 53
+	addw t2, t1, t0				# 54
+	li t1, -2100				# 55
+	add t0, t2, t1				# 56
+	j  mainRet0				# 57
 
 mainRet0:
-	addi a0, t2, 0				# 49
+	addi a0, t0, 0				# 58
 	ld s1, 0(sp)
-	addi sp, sp, 128				# 50
-	ld ra, -8(sp)				# 51
-	ld fp, -16(sp)				# 52
-	jr ra					# 53
+	addi sp, sp, 112				# 59
+	ld ra, -8(sp)				# 60
+	ld fp, -16(sp)				# 61
+	jr ra					# 62
 

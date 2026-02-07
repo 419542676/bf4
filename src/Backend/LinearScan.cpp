@@ -55,6 +55,7 @@ static MachineOperand *getMOperandImm(int imm) {
 void LinearScan::pass(MachineUnit *mUnit) {
 
     for (auto mFunc : mUnit->func_list) {
+        this->spilledReg = 0;
         computeLiveIntervals(mFunc);
 
         
@@ -171,6 +172,7 @@ std::ostream & operator << (std::ostream &os, const LinearScan::Interval &i) {
 }
 
 void LinearScan::linearScanRegisterAllocation(MachineFunction *mFunc) {
+    std::cout << "Running LinearScan on function..." << std::endl;
     for (auto [vreg, intvl] : mFunc->live_intervals) {
         intervals.emplace_back(new Interval{vreg, intvl.first, intvl.second, false});
     }
@@ -187,7 +189,7 @@ void LinearScan::linearScanRegisterAllocation(MachineFunction *mFunc) {
     for (auto &interval : intervals) {
         expireOldIntervals(interval.get());
         if (active.size() == init_free_regs.size()) {
-            spillInterval(interval.get(), mFunc->framesize);
+            spillInterval(interval.get(), mFunc);
         } else {
             assert(free_regs.back());
             interval->phy_reg = free_regs.back();
@@ -199,7 +201,7 @@ void LinearScan::linearScanRegisterAllocation(MachineFunction *mFunc) {
     for (auto &f_interval : f_intervals) {
         expireOldIntervals_f(f_interval.get());
         if (f_active.size() == init_free_f_regs.size()) {
-            spillInterval_f(f_interval.get(), mFunc->framesize);
+            spillInterval_f(f_interval.get(), mFunc);
         } else {
             f_interval->phy_reg = free_f_regs.back();
             free_f_regs.pop_back();
@@ -234,44 +236,54 @@ void LinearScan::expireOldIntervals_f(Interval *i) {
         free_f_regs.push_back(Fregister(j->phy_reg));
     }
 }
+void LinearScan::spillInterval(Interval *i, MachineFunction *mFunc) {
+    // 申请栈空间：通用寄存器(64位)通常占8字节
+    int offset = mFunc->allocateSpillSlot(8); 
+    
+    // 仅仅为了兼容后续 rewrite 的计数逻辑，保留计数器增加（虽然 offset 已经不再依赖它了）
+    ++spilledReg; 
 
-void LinearScan::spillInterval(Interval *i, int framesize) {
-    // 3 temp * 8 Bytes
-    int offset = - framesize - 24;
-    ++spilledReg;
-    // TODO (done) BUG!!! offset 是一直固定的，没有变化
-    // std::cerr << "before spill " << active.size() << std::endl;
+    // 取出当前占用寄存器的区间中，结束时间最晚的那个（贪心策略）
     auto spill = *active.rbegin();
+    
+    // 如果 active 列表里最晚结束的那个区间，比当前区间 i 结束得还晚
+    // 那么把寄存器让给当前区间 i，把那个最晚的 spill 赶到栈上去
     if (spill->end > i->end) {
-        i->phy_reg = spill->phy_reg;
+        i->phy_reg = spill->phy_reg; // 抢占寄存器
+        
         spill->spilled = true;
-        spill->offset = offset - spilledReg * 8;
+        spill->offset = offset;      
+        
         active.erase(spill);
         active.insert(i);
     } else {
+        // 否则，当前区间 i 自己去栈上
         i->spilled = true;
-        i->offset = offset - spilledReg * 8;
+        i->offset = offset;          
     }
-    // std::cerr << "after spill " << active.size() << std::endl;
 }
-void LinearScan::spillInterval_f(Interval *i, int framesize) {
-    // 3 temp * 8 Bytes
-    int offset = - framesize - 24;
+
+// 【浮点寄存器溢出处理】
+void LinearScan::spillInterval_f(Interval *i, MachineFunction *mFunc) {
+    // 申请栈空间：浮点寄存器(double)占8字节 (如果是float单精度则为4，但为了对齐通常分配8)
+    int offset = mFunc->allocateSpillSlot(8); 
+    
     ++spilledReg;
-    // TODO (done) BUG!!! offset 是一直固定的，没有变化
+
     auto spill = *f_active.rbegin();
     if (spill->end > i->end) {
         i->phy_reg = spill->phy_reg;
+        
         spill->spilled = true;
-        spill->offset = offset - spilledReg * 8;
+        spill->offset = offset;     
+        
         f_active.erase(spill);
         f_active.insert(i);
     } else {
         i->spilled = true;
-        i->offset = offset - spilledReg * 8;
+        i->offset = offset;          
     }
 }
-
 void LinearScan::updateUsedPhysicalRegs(const std::string &func_name, IREGISTER reg) {
     if (T0 <= reg && reg <= T2 || T3 <= reg && reg <= T6) caller_saved_regs[func_name].insert(reg);
     else if (reg == S1 || S2 <= reg && reg <= S11) callee_saved_regs[func_name].insert(reg);
